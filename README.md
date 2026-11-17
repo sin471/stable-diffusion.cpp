@@ -1,3 +1,49 @@
+# stable-diffusion.cpp — RX 570 (Polaris) tuning
+
+A mirror of [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) whose `tuning` branch optimizes Vulkan inference for the **AMD RX 570 (Polaris, gfx803)**. The ggml-side changes live in the companion mirror [sin471/ggml](https://github.com/sin471/ggml) (`tuning` branch), wired in as the submodule.
+
+## Results
+
+Steady state (weights resident), measured on an RX 570 8 GB.
+
+**Anima** — One Obsession Anima v5, 832×1216, 25 steps, cfg 4.0, euler
+
+| Configuration | s/image |
+|---|---|
+| Upstream build, Q8_0 GGUF, no cache | 587 |
+| Tuned build, f16 + EasyCache 0.16 | **214.6** (2.74×) |
+
+Quality of the adopted configuration against the f16 no-cache reference: LPIPS 0.101 (alex) / 0.157 (vgg), CLIP 0.989.
+
+**SDXL** — One Obsession (Illustrious), 832×1216, 25 steps, cfg 5.0, Q8_0 GGUF
+
+| Configuration | s/image |
+|---|---|
+| ComfyUI (DirectML) | ~318 |
+| Tuned build | 180.7 |
+| Tuned build + Spectrum | 100.9 |
+
+## Changes on the `tuning` branch
+
+1. **ggml: GCN/Polaris Vulkan matmul warptile tuning** (f32 and Q8_0 tile shapes in `ggml-vulkan`). Bit-identical output.
+2. **Attention SCALE → SOFT_MAX fusion** (`ggml_extend`): avoids materializing the scaled score tensor, roughly 1 GiB of memory traffic per step at 832×1216. Bit-identical output.
+3. **ggml: Anima DiT performance test shapes** for `test-backend-ops` (verification only).
+
+EasyCache and Spectrum are upstream sd.cpp features; the table above shows the configurations selected under the quality gate below.
+
+## Quality gate
+
+No speed change was adopted on speed alone. Each candidate was measured against an f16 no-cache reference on a fixed prompt and seed set, and had to hold LPIPS alex ≤ 0.15, vgg ≤ 0.19 and CLIP ≥ 0.985, plus pass visual inspection — any wholesale disappearance of image elements was an automatic reject. Equivalence-class changes (tiles, fusion) were required to be bit-identical. Final comparisons use the mean and spread over the same seed set, never a single run.
+
+## Branches
+
+- `master` — upstream mirror
+- `tuning` — the optimized branch (this README)
+
+---
+
+*Upstream README follows.*
+
 <p align="center">
   <img src="./assets/logo.png" width="360x">
 </p>
