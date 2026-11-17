@@ -4,39 +4,50 @@ A mirror of [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffu
 
 ## Results
 
-Steady state (weights resident), measured on an RX 570 8 GB.
+Steady state (weights resident), measured on an RX 570 8 GB. The two comparisons below are kept separate on purpose: the first isolates the code changes, the second is the fastest configuration found, which also uses quantization and cache settings.
 
-**Anima** — One Obsession Anima v5, 832×1216, 25 steps, cfg 4.0, euler
+### Fair comparison — code changes only
 
-| Configuration | s/image |
+Same quantization, no cache, fixed prompt and seed. This is the configuration to reuse if you want the speedup with **zero output change**.
+
+**Anima** — One Obsession Anima v5, Q8_0 GGUF, 832×1216, 25 steps, cfg 4.0, euler
+
+| Build | s/image |
 |---|---|
-| Upstream build, Q8_0 GGUF, no cache | 587 |
-| Tuned build, f16 + EasyCache 0.16 | **214.6** (2.74×) |
+| Stock | 587 |
+| Tuned (warptile) | ~389 (1.51×, measured end to end) |
+| Tuned (warptile + fusion) | ~370 (estimated from 14.29 s/step) |
 
-Quality of the adopted configuration against the f16 no-cache reference: LPIPS 0.101 (alex) / 0.157 (vgg), CLIP 0.989.
+**SDXL** — One Obsession (Illustrious), Q8_0 GGUF, 832×1216, 25 steps, cfg 5.0, euler
 
-**SDXL** — One Obsession (Illustrious), 832×1216, 25 steps, cfg 5.0, Q8_0 GGUF
-
-| Configuration | s/image |
+| Build | s/image |
 |---|---|
-| ComfyUI (DirectML) | ~318 |
-| Tuned build | 180.7 |
-| Tuned build + Spectrum | 100.9 |
+| Stock | 255.5 |
+| Tuned | 180.7 (1.41×) |
 
-## Changes on the `tuning` branch
+Zero-degradation verification: on Anima, the warptile build's output was **bit-identical** to the stock build (LPIPS 0, PSNR ∞), and the fusion build was bit-identical to the warptile build under identical settings. On SDXL, tuned vs stock output files were **MD5-identical on every seed tested (42/43/44)** — LPIPS 0 / 0, CLIP 1.0, PSNR ∞.
 
-1. **ggml: GCN/Polaris Vulkan matmul warptile tuning** (f32 and Q8_0 tile shapes in `ggml-vulkan`). Bit-identical output.
-2. **Attention SCALE → SOFT_MAX fusion** (`ggml_extend`): avoids materializing the scaled score tensor, roughly 1 GiB of memory traffic per step at 832×1216. Bit-identical output.
-3. **ggml: Anima DiT performance test shapes** for `test-backend-ops` (verification only).
+### Best configuration — quantization and caches included
 
-EasyCache and Spectrum are upstream sd.cpp features; the table above shows the configurations selected under the quality gate below.
+These numbers mix in quantization choices and step-cache approximations (upstream sd.cpp features). Each was adopted only after passing the quality gate below; the quality figures are against an f16 no-cache reference.
 
-## Zero-degradation verification
+**Anima** — 832×1216, 25 steps, cfg 4.0
 
-The code changes themselves (warptile tuning and the SCALE → SOFT_MAX fusion) change no output bits. The speed records above that involve EasyCache or Spectrum are configuration-level approximations, judged separately under the quality gate below.
+| Weights | Cache | s/image |
+|---|---|---|
+| Q8_0 GGUF | EasyCache 0.07 | 236.0 |
+| f16 | EasyCache 0.1 | 235.4 |
+| f16 | EasyCache 0.16 | **214.6** (adopted; LPIPS 0.101 / 0.157, CLIP 0.989) |
 
-- **Anima** (Q8_0 GGUF, no cache, 25 steps, fixed prompt, seed 42): the tile-tuned build's output was **bit-identical** to the baseline build (LPIPS 0, PSNR ∞). The fusion build was in turn bit-identical to the tile-tuned build under identical settings.
-- **SDXL** (Q8_0 GGUF, 25 steps): tuned vs stock build compared end to end — **MD5-identical output files on every seed tested (42/43/44)**, LPIPS 0 / 0, CLIP 1.0, PSNR ∞, while running 29% faster (255.5 → 180.7 s/image).
+**SDXL** — 832×1216, 25 steps, cfg 5.0
+
+| Weights | Cache | s/image |
+|---|---|---|
+| fp16 safetensors (ComfyUI, DirectML) | none | ~318 |
+| Q8_0 GGUF | UCache 0.5 | 129.9 |
+| Q8_0 GGUF | Spectrum | **100.9** (adopted default; LPIPS 0.120 / 0.160, CLIP 0.996) |
+
+Quantization check (SDXL, same build): Q8_0 vs f16 GGUF — LPIPS 0.090 (alex) / 0.115 (vgg), CLIP 0.998, PSNR 25.77. Q8_0 also samples ~13% faster per step and fits resident in 8 GB, which the f16 GGUF does not.
 
 ## Quality gate
 
