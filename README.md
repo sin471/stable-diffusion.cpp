@@ -31,6 +31,13 @@ Quality of the adopted configuration against the f16 no-cache reference: LPIPS 0
 
 EasyCache and Spectrum are upstream sd.cpp features; the table above shows the configurations selected under the quality gate below.
 
+## Zero-degradation verification
+
+The code changes themselves (warptile tuning and the SCALE → SOFT_MAX fusion) change no output bits. The speed records above that involve EasyCache or Spectrum are configuration-level approximations, judged separately under the quality gate below.
+
+- **Anima** (Q8_0 GGUF, no cache, 25 steps, fixed prompt, seed 42): the tile-tuned build's output was **bit-identical** to the baseline build (LPIPS 0, PSNR ∞). The fusion build was in turn bit-identical to the tile-tuned build under identical settings.
+- **SDXL** (Q8_0 GGUF, 25 steps): tuned vs stock build compared end to end — **MD5-identical output files on every seed tested (42/43/44)**, LPIPS 0 / 0, CLIP 1.0, PSNR ∞, while running 29% faster (255.5 → 180.7 s/image).
+
 ## Quality gate
 
 No speed change was adopted on speed alone. Each candidate was measured against an f16 no-cache reference on a fixed prompt and seed set, and had to hold LPIPS alex ≤ 0.15, vgg ≤ 0.19 and CLIP ≥ 0.985, plus pass visual inspection — any wholesale disappearance of image elements was an automatic reject. Equivalence-class changes (tiles, fusion) were required to be bit-identical. Final comparisons use the mean and spread over the same seed set, never a single run.
