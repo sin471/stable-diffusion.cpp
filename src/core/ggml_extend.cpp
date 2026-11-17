@@ -771,11 +771,15 @@ ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* runner_ctx,
 
         auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
         ggml_prec_set_acc(kq, GGML_PREC_F32);
-        kq = ggml_scale_inplace(ctx, kq, scale);
         if (mask) {
+            kq = ggml_scale_inplace(ctx, kq, scale);
             kq = ggml_add_inplace(ctx, kq, mask);
+            kq = ggml_soft_max_inplace(ctx, kq);
+        } else {
+            // [sd-tuning] fold the 1/sqrt(d) scale into the softmax kernel: saves one full
+            // read+write pass over the [L_k, L_q, heads] score tensor (~1 GiB at 832x1216).
+            kq = ggml_soft_max_ext_inplace(ctx, kq, nullptr, scale, 0.0f);
         }
-        kq = ggml_soft_max_inplace(ctx, kq);
 
         kqv = ggml_mul_mat(ctx, v, kq);  // [N * n_head, L_q, d_head]
 
