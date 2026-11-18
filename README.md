@@ -53,6 +53,31 @@ Quantization check (SDXL, same build): Q8_0 vs f16 GGUF — LPIPS 0.090 (alex) /
 
 No speed change was adopted on speed alone. Each candidate was measured against an f16 no-cache reference on a fixed prompt and seed set, and had to hold LPIPS alex ≤ 0.15, vgg ≤ 0.19 and CLIP ≥ 0.985, plus pass visual inspection — any wholesale disappearance of image elements was an automatic reject. Equivalence-class changes (tiles, fusion) were required to be bit-identical. Final comparisons use the mean and spread over the same seed set, never a single run.
 
+## Attention head splitting (large canvases)
+
+On GPUs without cooperative matrix support (e.g. RX 570 / Polaris), flash
+attention falls back to a scalar kernel and measures 1.78-1.82x *slower* than
+the naive attention path, while the naive path materializes the full
+Lq x Lk score matrix: at 1024x1536 that is about 2.4 GB in f32, which exceeds
+both the compute-buffer budget and the 2 GiB maxBufferSize, so the tensor
+spills to system RAM (232 s/it).
+
+This branch splits the score computation by head groups in the shared
+attention helper when the f32 score size exceeds a threshold, capping the
+peak at 1/G of the unsplit size. Below the threshold the graph is identical
+to upstream. Bit-identical output was verified at 832x1216 (forced G=2 vs.
+off, identical SHA-256). Measured on RX 570: 1024x1536 completes on-GPU with
+automatic G=4, an 844 MB compute buffer, and a steady 32.25 s/it. When the
+split triggers there is a +8.6% overhead, attributed mainly to an interaction
+with ggml-vulkan graph optimization rather than to the split itself; the
+production size (832x1216) never triggers it and is unaffected.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SD_ATTN_HEAD_SPLIT` | `1` | `0` disables the split (graph identical to upstream) |
+| `SD_ATTN_HEAD_SPLIT_THRESHOLD` | `1073741824` (1 GiB) | f32 score size above which the split triggers |
+| `SD_ATTN_HEAD_SPLIT_GROUPS` | `0` (auto) | positive value forces G, bypassing the threshold |
+
 ## Branches
 
 - `master` — upstream mirror

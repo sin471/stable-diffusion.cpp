@@ -1,7 +1,11 @@
 #include "core/ggml_extend.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <mutex>
+#include <set>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -593,6 +597,58 @@ ggml_tensor* ggml_ext_cast_f32(GGMLRunnerContext* runner_ctx, ggml_tensor* a) {
     }
 }
 
+namespace {
+
+int64_t env_int64(const char* name, int64_t default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    return std::strtoll(value, nullptr, 10);
+}
+
+// SD_ATTN_HEAD_SPLIT=0 disables, SD_ATTN_HEAD_SPLIT_THRESHOLD is the f32 score-tensor size in
+// bytes above which the split kicks in, SD_ATTN_HEAD_SPLIT_GROUPS forces G (skips the threshold).
+// G must divide n_kv_head so that every group maps to whole kv heads.
+int attention_head_split_groups(int64_t L_q, int64_t L_k, int64_t n_head, int64_t n_kv_head, int64_t N) {
+    static const bool enabled       = env_int64("SD_ATTN_HEAD_SPLIT", 1) != 0;
+    static const int64_t threshold  = env_int64("SD_ATTN_HEAD_SPLIT_THRESHOLD", int64_t(1) << 30);
+    static const int64_t forced     = env_int64("SD_ATTN_HEAD_SPLIT_GROUPS", 0);
+    static bool warned_invalid_force = false;
+    if (!enabled || n_head <= 1 || n_kv_head <= 0 || n_head % n_kv_head != 0) {
+        return 1;
+    }
+    if (forced > 0) {
+        if (forced > n_kv_head || n_kv_head % forced != 0) {
+            if (!warned_invalid_force) {
+                warned_invalid_force = true;
+                LOG_WARN("SD_ATTN_HEAD_SPLIT_GROUPS=%lld does not divide kv heads (%lld); not splitting",
+                         (long long)forced, (long long)n_kv_head);
+            }
+            return 1;
+        }
+        return static_cast<int>(forced);
+    }
+    const int64_t per_head_bytes = L_q * L_k * N * static_cast<int64_t>(sizeof(float));
+    auto fits                    = [&](int64_t g) { return per_head_bytes * (n_head / g) <= threshold; };
+    if (fits(1)) {
+        return 1;
+    }
+    for (int64_t g = 2; g <= n_kv_head; g *= 2) {
+        if (n_kv_head % g == 0 && fits(g)) {
+            return static_cast<int>(g);
+        }
+    }
+    for (int64_t g = 2; g <= n_kv_head; g++) {
+        if (n_kv_head % g == 0 && fits(g)) {
+            return static_cast<int>(g);
+        }
+    }
+    return static_cast<int>(n_kv_head);
+}
+
+}  // namespace
+
 ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* runner_ctx,
                                     ggml_tensor* q,
                                     ggml_tensor* k,
@@ -769,22 +825,73 @@ ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* runner_ctx,
         v = ggml_ext_cont(runner_ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
         v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);          // [N * n_kv_head, d_head, L_k]
 
-        auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
-        ggml_prec_set_acc(kq, GGML_PREC_F32);
-        if (mask) {
-            kq = ggml_scale_inplace(ctx, kq, scale);
-            kq = ggml_add_inplace(ctx, kq, mask);
-            kq = ggml_soft_max_inplace(ctx, kq);
+        auto build_scores_out = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in) -> ggml_tensor* {
+            auto kq = ggml_mul_mat(ctx, k_in, q_in);  // [heads, L_q, L_k]
+            ggml_prec_set_acc(kq, GGML_PREC_F32);
+            if (mask) {
+                kq = ggml_scale_inplace(ctx, kq, scale);
+                kq = ggml_add_inplace(ctx, kq, mask);
+                kq = ggml_soft_max_inplace(ctx, kq);
+            } else {
+                // [sd-tuning] fold the 1/sqrt(d) scale into the softmax kernel: saves one full
+                // read+write pass over the [L_k, L_q, heads] score tensor (~1 GiB at 832x1216).
+                kq = ggml_soft_max_ext_inplace(ctx, kq, nullptr, scale, 0.0f);
+            }
+            return ggml_mul_mat(ctx, v_in, kq);  // [heads, L_q, d_head]
+        };
+
+        // [sd-tuning] Head-group split: the f32 score tensor at 1024x1536 (2.3 GiB) exceeds the
+        // Vulkan maxBufferSize, so slice q/k/v by head range *before* mul_mat and run the groups
+        // sequentially. Heads are only a batch dimension in every op here, so each group is
+        // computed bit-identically to the unsplit graph. Group boundaries follow kv heads (GQA).
+        // N > 1 interleaves heads with batch, and a per-head mask would need slicing; both
+        // keep the unsplit graph.
+        const int head_split = attention_head_split_groups(L_q, L_k, n_head, n_kv_head, N);
+        const bool can_split = head_split > 1 && N == 1 && q->type == GGML_TYPE_F32 && q->ne[3] == 1 && k->ne[3] == 1 &&
+                               q->ne[2] == n_head && k->ne[2] == n_kv_head && v->ne[2] == n_kv_head &&
+                               (mask == nullptr || (mask->ne[2] == 1 && mask->ne[3] == 1));
+        if (can_split) {
+            {
+                static std::mutex logged_mutex;
+                static std::set<std::tuple<int64_t, int64_t, int64_t, int>> logged;
+                std::lock_guard<std::mutex> lock(logged_mutex);
+                if (logged.emplace(L_q, L_k, n_head, head_split).second) {
+                    LOG_INFO("attention head split: L_q=%lld L_k=%lld heads=%lld -> %d groups (scores %.1f MiB -> %.1f MiB per group)",
+                             (long long)L_q, (long long)L_k, (long long)n_head, head_split,
+                             L_q * L_k * n_head * 4 / 1048576.0, L_q * L_k * n_head * 4 / 1048576.0 / head_split);
+                }
+            }
+            const int64_t q_heads  = n_head / head_split;
+            const int64_t kv_heads = n_kv_head / head_split;
+            auto head_view         = [&](ggml_tensor* t, int64_t heads, int64_t first) {
+                return ggml_view_3d(ctx, t, t->ne[0], t->ne[1], heads, t->nb[1], t->nb[2], t->nb[2] * first);
+            };
+            std::vector<ggml_tensor*> outs;
+            outs.reserve(head_split);
+            ggml_tensor* prev_out = nullptr;
+            for (int g = 0; g < head_split; g++) {
+                auto q_g = head_view(q, q_heads, q_heads * g);
+                if (prev_out != nullptr) {
+                    // The Vulkan graph optimizer runs independent mul_mats concurrently, which
+                    // would keep every group's score tensor alive at once. Routing q_g through
+                    // a concat with one head of the previous group's output (an exact copy)
+                    // serializes the groups without changing any value.
+                    auto chained = ggml_concat(ctx, head_view(prev_out, 1, 0), q_g, 2);
+                    q_g          = head_view(chained, q_heads, 1);
+                }
+                auto k_g = head_view(k, kv_heads, kv_heads * g);
+                auto v_g = head_view(v, kv_heads, kv_heads * g);
+                prev_out = build_scores_out(q_g, k_g, v_g);          // [q_heads, L_q, d_head]
+                outs.push_back(ggml_permute(ctx, prev_out, 0, 2, 1, 3));  // [L_q, q_heads, d_head]
+            }
+            // Concatenating the permuted groups yields the contiguous [N, L_q, n_head, d_head]
+            // layout directly, so the final cont below is a no-op.
+            kqv = ggml_ext_vec_concat(runner_ctx, outs, 1);
         } else {
-            // [sd-tuning] fold the 1/sqrt(d) scale into the softmax kernel: saves one full
-            // read+write pass over the [L_k, L_q, heads] score tensor (~1 GiB at 832x1216).
-            kq = ggml_soft_max_ext_inplace(ctx, kq, nullptr, scale, 0.0f);
+            kqv = build_scores_out(q, k, v);                           // [N * n_head, L_q, d_head]
+            kqv = ggml_reshape_4d(ctx, kqv, d_head, L_q, n_head, N);  // [N, n_head, L_q, d_head]
+            kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                 // [N, L_q, n_head, d_head]
         }
-
-        kqv = ggml_mul_mat(ctx, v, kq);  // [N * n_head, L_q, d_head]
-
-        kqv = ggml_reshape_4d(ctx, kqv, d_head, L_q, n_head, N);  // [N, n_head, L_q, d_head]
-        kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                 // [N, L_q, n_head, d_head]
     }
 
     kqv = ggml_ext_cont(runner_ctx, kqv);
